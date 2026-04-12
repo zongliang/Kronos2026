@@ -5,7 +5,7 @@
 
 <div align="center">
 
-</a> 
+
 <a href="https://huggingface.co/NeoQuasar"> 
 <img src="https://img.shields.io/badge/🤗-Hugging_Face-yellow" alt="Hugging Face"> 
 </a> 
@@ -47,14 +47,11 @@
 > trained on data from over **45 global exchanges**.
 
 
-</div>
-
 ## 📰 News
-*   🚩 **[2025.11.10]** Kronos has been accpeted by AAAI 2026.
+*   🚩 **[2025.11.10]** Kronos has been accepted by AAAI 2026.
 *   🚩 **[2025.08.17]** We have released the scripts for fine-tuning! Check them out to adapt Kronos to your own tasks.
 *   🚩 **[2025.08.02]** Our paper is now available on [arXiv](https://arxiv.org/abs/2508.02739)!
 
-<p align="center">
 
 ## 📜 Introduction
 
@@ -114,7 +111,7 @@ model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
 
 #### 2. Instantiate the Predictor
 
-Create an instance of `KronosPredictor`, passing the model, tokenizer, and desired device.
+Create an instance of `KronosPredictor`, passing the model, tokenizer, and desired context length.
 
 ```python
 # Initialize the predictor
