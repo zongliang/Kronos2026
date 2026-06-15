@@ -8,6 +8,7 @@ from tqdm import trange
 
 sys.path.append("../")
 from model.module import *
+from model.moq import MixtureOfQuantizers, BSQCore
 
 
 class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
@@ -37,7 +38,8 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
 
     """
 
-    def __init__(self, d_in, d_model, n_heads, ff_dim, n_enc_layers, n_dec_layers, ffn_dropout_p, attn_dropout_p, resid_dropout_p, s1_bits, s2_bits, beta, gamma0, gamma, zeta, group_size):
+    def __init__(self, d_in, d_model, n_heads, ff_dim, n_enc_layers, n_dec_layers, ffn_dropout_p, attn_dropout_p, resid_dropout_p, s1_bits, s2_bits, beta, gamma0, gamma, zeta, group_size,
+                 use_moq=False, moq_num_experts=4, moq_router_mode='alf', moq_regime_dim=0, moq_load_balance_weight=1e-2):
 
         super().__init__()
         self.d_in = d_in
@@ -71,31 +73,96 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
         self.post_quant_embed = nn.Linear(in_features=self.codebook_dim, out_features=self.d_model) # Linear layer after quantization (full codebook)
         self.tokenizer = BSQuantizer(self.s1_bits, self.s2_bits, beta, gamma0, gamma, zeta, group_size) # BSQuantizer module
 
-    def forward(self, x):
+        # --- Mixture of Quantizers (opt-in) -------------------------------
+        # When enabled, the coarse s1 token is quantized by a family of K BSQ
+        # experts (regime-conditioned geometry) while the fine s2 token keeps a
+        # single BSQ. Disabled by default so existing pretrained tokenizers load
+        # and behave identically.
+        self.use_moq = use_moq
+        self.moq_num_experts = moq_num_experts
+        if use_moq:
+            self.moq = MixtureOfQuantizers(
+                in_dim=self.d_model,
+                embed_dim=self.s1_bits,
+                num_experts=moq_num_experts,
+                beta=beta, gamma0=gamma0, gamma=gamma, zeta=zeta,
+                group_size=min(group_size, self.s1_bits),
+                router_mode=moq_router_mode,
+                regime_dim=moq_regime_dim,
+                load_balance_weight=moq_load_balance_weight,
+            )
+            self.s2_quant = BSQCore(
+                self.s2_bits, beta, gamma0, gamma, zeta,
+                group_size=min(group_size, self.s2_bits),
+            )
+            # s1 comes from the MoQ experts (which project d_model -> s1_bits
+            # directly); only the s2 part needs a projection off the encoder.
+            self.quant_embed_s2 = nn.Linear(self.d_model, self.s2_bits)
+
+    def _moq_quantize(self, z_enc, regime=None, collect_metrics=True):
+        """Quantize encoder hidden states with MoQ on s1 and single BSQ on s2.
+
+        Args:
+            z_enc (torch.Tensor): Encoder output, shape (B, T, d_model).
+            regime (torch.Tensor, optional): Raw (pre-normalization) volatility
+                proxy for the router, shape (B, T, moq_regime_dim). See design 2.3.
+
+        Returns:
+            tuple: (quantized_full, quantized_s1, loss, out)
+                - quantized_full (B, T, codebook_dim): concat of s1 and s2 codes.
+                - quantized_s1 (B, T, s1_bits): the s1 codes alone (for z_pre).
+                - loss: combined MoQ + s2-BSQ quantization loss.
+                - out (dict): expert_index, vertex_index, s2_index, routing stats.
+        """
+        quantized_s1, moq_loss, moq_out = self.moq(
+            z_enc, regime=regime, collect_metrics=collect_metrics
+        )
+        v_s2 = self.quant_embed_s2(z_enc)
+        quantized_s2, s2_loss, s2_index, _ = self.s2_quant(
+            v_s2, collect_metrics=collect_metrics
+        )
+        quantized_full = torch.cat([quantized_s1, quantized_s2], dim=-1)
+        loss = moq_loss + s2_loss
+        out = {
+            "expert_index": moq_out["expert_index"],
+            "vertex_index": moq_out["vertex_index"],
+            "s2_index": s2_index,
+            "f": moq_out["f"],
+            "p": moq_out["p"],
+            "aux_loss": moq_out["aux_loss"],
+        }
+        return quantized_full, quantized_s1, loss, out
+
+    def forward(self, x, regime=None):
         """
         Forward pass of the KronosTokenizer.
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_in).
+            regime (torch.Tensor, optional): Raw volatility proxy for the MoQ
+                router (used only when ``use_moq`` is enabled). Shape
+                (batch_size, seq_len, moq_regime_dim).
 
         Returns:
             tuple: A tuple containing:
                 - tuple: (z_pre, z) - Reconstructed outputs from decoder with s1_bits and full codebook respectively,
                          both of shape (batch_size, seq_len, d_in).
-                - torch.Tensor: bsq_loss - Loss from the BSQuantizer.
-                - torch.Tensor: quantized - Quantized representation from BSQuantizer.
-                - torch.Tensor: z_indices - Indices from the BSQuantizer.
+                - torch.Tensor: bsq_loss - Loss from the quantizer.
+                - torch.Tensor: quantized - Quantized representation.
+                - z_indices: Indices from the quantizer (a dict in MoQ mode).
         """
         z = self.embed(x)
 
         for layer in self.encoder:
             z = layer(z)
 
-        z = self.quant_embed(z) # (B, T, codebook)
+        if self.use_moq:
+            quantized, quantized_pre, bsq_loss, z_indices = self._moq_quantize(z, regime)
+        else:
+            z = self.quant_embed(z) # (B, T, codebook)
+            bsq_loss, quantized, z_indices = self.tokenizer(z)
+            quantized_pre = quantized[:, :, :self.s1_bits] # Extract the first part of quantized representation (s1_bits)
 
-        bsq_loss, quantized, z_indices = self.tokenizer(z)
-
-        quantized_pre = quantized[:, :, :self.s1_bits] # Extract the first part of quantized representation (s1_bits)
         z_pre = self.post_quant_embed_pre(quantized_pre)
 
         z = self.post_quant_embed(quantized)
@@ -139,22 +206,29 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
         x = x * q_scale
         return x
 
-    def encode(self, x, half=False):
+    def encode(self, x, half=False, regime=None):
         """
         Encodes the input data into quantized indices.
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_in).
             half (bool, optional): Whether to use half quantization in BSQuantizer. Defaults to False.
+            regime (torch.Tensor, optional): Raw volatility proxy for the MoQ router.
 
         Returns:
-            torch.Tensor: Quantized indices from BSQuantizer.
+            In baseline mode: quantized indices from BSQuantizer.
+            In MoQ mode: a list ``[expert_index, vertex_index, s2_index]`` of
+            per-step token factors (each shape (B, T)).
         """
         z = self.embed(x)
         for layer in self.encoder:
             z = layer(z)
-        z = self.quant_embed(z)
 
+        if self.use_moq:
+            _, _, _, out = self._moq_quantize(z, regime, collect_metrics=False)
+            return [out["expert_index"], out["vertex_index"], out["s2_index"]]
+
+        z = self.quant_embed(z)
         bsq_loss, quantized, z_indices = self.tokenizer(z, half=half, collect_metrics=False)
         return z_indices
 
@@ -169,12 +243,40 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
         Returns:
             torch.Tensor: Reconstructed output tensor of shape (batch_size, seq_len, d_in).
         """
-        quantized = self.indices_to_bits(x, half)
+        if self.use_moq:
+            quantized = self._moq_indices_to_bits(x)
+        else:
+            quantized = self.indices_to_bits(x, half)
         z = self.post_quant_embed(quantized)
         for layer in self.decoder:
             z = layer(z)
         z = self.head(z)
         return z
+
+    def _moq_indices_to_bits(self, x):
+        """Reconstruct the codebook vector from MoQ token factors.
+
+        The decoded signal depends only on the chosen sphere vertex (the s1 bit
+        pattern) and the s2 code; the expert id is a routing label that does not
+        change the vertex bits, so it is not needed here.
+
+        Args:
+            x: ``[expert_index, vertex_index, s2_index]`` (expert_index ignored)
+               or ``[vertex_index, s2_index]``. Each index has shape (B, T).
+        """
+        if len(x) == 3:
+            _, vertex_index, s2_index = x
+        else:
+            vertex_index, s2_index = x
+
+        def to_bits(idx, n_bits):
+            mask = 2 ** torch.arange(n_bits, device=idx.device, dtype=torch.long)
+            bits = (idx.unsqueeze(-1) & mask) != 0
+            return bits.float() * 2 - 1
+
+        s1_bits = to_bits(vertex_index, self.s1_bits) / (self.s1_bits ** 0.5)
+        s2_bits = to_bits(s2_index, self.s2_bits) / (self.s2_bits ** 0.5)
+        return torch.cat([s1_bits, s2_bits], dim=-1)
 
 
 class Kronos(nn.Module, PyTorchModelHubMixin):
@@ -195,7 +297,8 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
         learn_te (bool): Whether to use learnable temporal embeddings.
     """
 
-    def __init__(self, s1_bits, s2_bits, n_layers, d_model, n_heads, ff_dim, ffn_dropout_p, attn_dropout_p, resid_dropout_p, token_dropout_p, learn_te):
+    def __init__(self, s1_bits, s2_bits, n_layers, d_model, n_heads, ff_dim, ffn_dropout_p, attn_dropout_p, resid_dropout_p, token_dropout_p, learn_te,
+                 use_moq=False, moq_num_experts=4):
         super().__init__()
         self.s1_bits = s1_bits
         self.s2_bits = s2_bits
@@ -209,9 +312,19 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
         self.resid_dropout_p = resid_dropout_p
         self.token_dropout_p = token_dropout_p
 
+        self.use_moq = use_moq
+        self.moq_num_experts = moq_num_experts
+
         self.s1_vocab_size = 2 ** self.s1_bits
         self.token_drop = nn.Dropout(self.token_dropout_p)
-        self.embedding = HierarchicalEmbedding(self.s1_bits, self.s2_bits, self.d_model)
+        if use_moq:
+            # Factorized embedding (ExpertEmb + VertexEmb + s2) and a triple head
+            # that predicts (expert, s1 vertex, s2). See design 2.4 / 6.5.
+            self.embedding = FactorizedExpertEmbedding(self.s1_bits, self.s2_bits, moq_num_experts, self.d_model)
+            self.head = MoQTripleHead(self.s1_bits, self.s2_bits, moq_num_experts, self.d_model)
+        else:
+            self.embedding = HierarchicalEmbedding(self.s1_bits, self.s2_bits, self.d_model)
+            self.head = DualHead(self.s1_bits, self.s2_bits, self.d_model)
         self.time_emb = TemporalEmbedding(self.d_model, self.learn_te)
         self.transformer = nn.ModuleList([
             TransformerBlock(self.d_model, self.n_heads, self.ff_dim, self.ffn_dropout_p, self.attn_dropout_p, self.resid_dropout_p)
@@ -219,7 +332,6 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
         ])
         self.norm = RMSNorm(self.d_model)
         self.dep_layer = DependencyAwareLayer(self.d_model)
-        self.head = DualHead(self.s1_bits, self.s2_bits, self.d_model)
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -251,6 +363,15 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
                 - s1 logits: Logits for s1 token predictions. Shape: [batch_size, seq_len, s1_vocab_size]
                 - s2_logits: Logits for s2 token predictions, conditioned on s1. Shape: [batch_size, seq_len, s2_vocab_size]
         """
+        if self.use_moq:
+            # In MoQ mode the coarse token is factorized: pass s1_ids as the
+            # pair (expert_ids, vertex_ids).
+            expert_ids, vertex_ids = s1_ids
+            return self._moq_forward(expert_ids, vertex_ids, s2_ids, stamp=stamp,
+                                     padding_mask=padding_mask,
+                                     use_teacher_forcing=use_teacher_forcing,
+                                     s1_targets=s1_targets)
+
         x = self.embedding([s1_ids, s2_ids])
         if stamp is not None:
             time_embedding = self.time_emb(stamp)
@@ -274,6 +395,44 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
         x2 = self.dep_layer(x, sibling_embed, key_padding_mask=padding_mask) # Dependency Aware Layer: Condition on s1 embeddings
         s2_logits = self.head.cond_forward(x2)
         return s1_logits, s2_logits
+
+    def _moq_forward(self, expert_ids, vertex_ids, s2_ids, stamp=None,
+                     padding_mask=None, use_teacher_forcing=False,
+                     s1_targets=None):
+        """MoQ autoregressive forward.
+
+        Inputs are the factorized coarse token ``(expert_ids, vertex_ids)`` plus
+        the fine token ``s2_ids``. Predicts ``(expert_logits, vertex_logits)``
+        from the context and ``s2_logits`` conditioned on the realized s1 token.
+
+        Args:
+            s1_targets (tuple, optional): ``(expert_targets, vertex_targets)`` used
+                as the s2 conditioning when teacher forcing.
+        """
+        x = self.embedding([expert_ids, vertex_ids, s2_ids])
+        if stamp is not None:
+            x = x + self.time_emb(stamp)
+        x = self.token_drop(x)
+
+        for layer in self.transformer:
+            x = layer(x, key_padding_mask=padding_mask)
+        x = self.norm(x)
+
+        expert_logits, vertex_logits = self.head(x)
+
+        if use_teacher_forcing:
+            expert_tgt, vertex_tgt = s1_targets
+            sibling_embed = self.embedding.s1_embed(expert_tgt, vertex_tgt)
+        else:
+            e_probs = F.softmax(expert_logits.detach(), dim=-1)
+            v_probs = F.softmax(vertex_logits.detach(), dim=-1)
+            sample_e = torch.multinomial(e_probs.view(-1, self.moq_num_experts), 1).view(expert_ids.shape)
+            sample_v = torch.multinomial(v_probs.view(-1, self.s1_vocab_size), 1).view(vertex_ids.shape)
+            sibling_embed = self.embedding.s1_embed(sample_e, sample_v)
+
+        x2 = self.dep_layer(x, sibling_embed, key_padding_mask=padding_mask)
+        s2_logits = self.head.cond_forward(x2)
+        return expert_logits, vertex_logits, s2_logits
 
     def decode_s1(self, s1_ids, s2_ids, stamp=None, padding_mask=None):
         """

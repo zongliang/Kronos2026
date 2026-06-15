@@ -513,6 +513,100 @@ class DualHead(nn.Module):
         return self.proj_s2(x2)
 
 
+class FactorizedExpertEmbedding(nn.Module):
+    """Factorized token embedding for a MoQ tokenizer (design section 2.4, option B).
+
+    The coarse token s1 is factorized into ``(expert_id, vertex_id)`` instead of a
+    single Cartesian id. The embedding is ``ExpertEmb[expert] + VertexEmb[vertex]``,
+    fused with the fine token s2 embedding. Vocabulary grows by only
+    ``num_experts + 2^s1_bits`` (vs ``num_experts * 2^s1_bits`` for a Cartesian
+    codebook), and the per-vertex semantics are shared across experts.
+
+    Drop-in compatible with :class:`HierarchicalEmbedding`'s call signature when
+    given ``(s1_ids, s2_ids)``: an s1 id without an explicit expert is treated as
+    expert 0 (so single-expert / baseline tokens still embed sensibly).
+    """
+
+    def __init__(self, s1_bits, s2_bits, num_experts, d_model=256):
+        super().__init__()
+        self.s1_bits = s1_bits
+        self.s2_bits = s2_bits
+        self.num_experts = num_experts
+        self.d_model = d_model
+
+        self.emb_expert = nn.Embedding(num_experts, d_model)
+        self.emb_vertex = nn.Embedding(2 ** s1_bits, d_model)
+        self.emb_s2 = nn.Embedding(2 ** s2_bits, d_model)
+        self.fusion_proj = nn.Linear(d_model * 2, d_model)
+
+        for emb in (self.emb_expert, self.emb_vertex, self.emb_s2):
+            nn.init.normal_(emb.weight, mean=0, std=d_model ** -0.5)
+
+    def s1_embed(self, expert_ids, vertex_ids):
+        return (self.emb_expert(expert_ids) + self.emb_vertex(vertex_ids)) \
+            * math.sqrt(self.d_model)
+
+    def forward(self, token_ids):
+        """token_ids: ``(expert_ids, vertex_ids, s2_ids)`` or ``(s1_ids, s2_ids)``.
+
+        In the 2-tuple form the s1 ids are vertex ids with expert assumed 0.
+        Output: ``[batch, seq_len, d_model]``.
+        """
+        if len(token_ids) == 3:
+            expert_ids, vertex_ids, s2_ids = token_ids
+        else:
+            vertex_ids, s2_ids = token_ids
+            expert_ids = torch.zeros_like(vertex_ids)
+        s1_emb = self.s1_embed(expert_ids, vertex_ids)
+        s2_emb = self.emb_s2(s2_ids) * math.sqrt(self.d_model)
+        return self.fusion_proj(torch.cat([s1_emb, s2_emb], dim=-1))
+
+
+class MoQTripleHead(nn.Module):
+    """Autoregressive head for a MoQ tokenizer: predicts (expert, vertex, s2).
+
+    Chained factorization following the existing s1->s2 dependency: the expert and
+    the s1 vertex are predicted from the transformer context, and s2 is predicted
+    conditioned on s1 (via the dependency-aware layer, as in :class:`DualHead`).
+    """
+
+    def __init__(self, s1_bits, s2_bits, num_experts, d_model):
+        super().__init__()
+        self.num_experts = num_experts
+        self.vocab_vertex = 2 ** s1_bits
+        self.vocab_s2 = 2 ** s2_bits
+        self.proj_expert = nn.Linear(d_model, num_experts)
+        self.proj_vertex = nn.Linear(d_model, self.vocab_vertex)
+        self.proj_s2 = nn.Linear(d_model, self.vocab_s2)
+
+    def forward(self, x):
+        return self.proj_expert(x), self.proj_vertex(x)
+
+    def cond_forward(self, x2):
+        return self.proj_s2(x2)
+
+    def compute_loss(self, expert_logits, vertex_logits, s2_logits,
+                     expert_targets, vertex_targets, s2_targets, padding_mask=None):
+        if padding_mask is not None:
+            valid = (padding_mask == 0)
+            expert_logits, vertex_logits, s2_logits = \
+                expert_logits[valid], vertex_logits[valid], s2_logits[valid]
+            expert_targets, vertex_targets, s2_targets = \
+                expert_targets[valid], vertex_targets[valid], s2_targets[valid]
+            ce_e = F.cross_entropy(expert_logits, expert_targets)
+            ce_v = F.cross_entropy(vertex_logits, vertex_targets)
+            ce_s2 = F.cross_entropy(s2_logits, s2_targets)
+        else:
+            ce_e = F.cross_entropy(expert_logits.reshape(-1, self.num_experts),
+                                   expert_targets.reshape(-1))
+            ce_v = F.cross_entropy(vertex_logits.reshape(-1, self.vocab_vertex),
+                                   vertex_targets.reshape(-1))
+            ce_s2 = F.cross_entropy(s2_logits.reshape(-1, self.vocab_s2),
+                                    s2_targets.reshape(-1))
+        ce_loss = (ce_e + ce_v + ce_s2) / 3
+        return ce_loss, ce_e, ce_v, ce_s2
+
+
 class FixedEmbedding(nn.Module):
     def __init__(self, c_in, d_model):
         super(FixedEmbedding, self).__init__()
