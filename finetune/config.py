@@ -70,6 +70,19 @@ class Config:
         self.seed = 100  # Global random seed for reproducibility.
 
         # =================================================================
+        # Local Intrinsic Dimension (LID) monitoring
+        # Reproduces arXiv:2506.01034 ("Less is More: Local Intrinsic
+        # Dimensions of Contextual Language Models"): the mean LID of the
+        # predictor's contextual embeddings is a label-free signal of training
+        # dynamics (exhaustion / overfitting / grokking). See lid/README.md.
+        # =================================================================
+        self.use_lid_monitor = True  # Set False to disable LID measurement.
+        self.lid_n_neighbors = 64     # Neighbourhood size for the local TwoNN fit.
+        self.lid_n_anchors = 512      # Number of anchor embeddings sampled per layer.
+        self.lid_max_tokens = 4000    # Cap on token embeddings collected per layer.
+        self.lid_probe_batches = 2    # Validation batches used as the fixed LID probe.
+
+        # =================================================================
         # Experiment Logging & Saving
         # =================================================================
         self.use_comet = True # Set to False if you don't want to use Comet ML

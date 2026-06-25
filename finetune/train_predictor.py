@@ -24,6 +24,51 @@ from utils.training_utils import (
     get_model_size,
     format_time
 )
+# Local Intrinsic Dimension monitoring (reproduction of arXiv:2506.01034).
+from lid import LIDMonitor, measure_model
+
+
+def build_lid_probe(val_loader, n_batches):
+    """Grab a fixed set of validation batches to use as the LID probe.
+
+    The same probe is re-used every epoch so that changes in the measured LID
+    reflect the evolving model, not a changing input set.
+    """
+    probe = []
+    for batch_x, batch_x_stamp in val_loader:
+        probe.append((batch_x.cpu(), batch_x_stamp.cpu()))
+        if len(probe) >= n_batches:
+            break
+    return probe
+
+
+def measure_and_log_lid(model, tokenizer, probe, config, device, monitor,
+                        epoch_idx, train_loss, val_loss, logger):
+    """Measure per-layer mean LID on the probe and feed it to the monitor.
+
+    Guarded so that a measurement failure can never interrupt training.
+    """
+    try:
+        layer_lid = measure_model(
+            model.module, probe, tokenizer=tokenizer, device=device,
+            n_neighbors=config['lid_n_neighbors'],
+            n_anchors=config['lid_n_anchors'],
+            max_tokens_per_layer=config['lid_max_tokens'],
+        )
+    except Exception as exc:  # pragma: no cover - never break training on LID
+        print(f"[LID] measurement skipped: {exc}")
+        return
+
+    snap = monitor.record(epoch_idx, layer_lid, train_loss=train_loss, val_loss=val_loss)
+    report = monitor.detect_regime()
+    print(f"[LID] Epoch {epoch_idx + 1}: mean LID {snap.mean_lid:.3f} | "
+          + " ".join(f"{k}={v:.2f}" for k, v in layer_lid.items()))
+    print(f"[LID] {report.summary()}")
+
+    if logger:
+        logger.log_metric('lid_mean', snap.mean_lid, epoch=epoch_idx)
+        for name, value in layer_lid.items():
+            logger.log_metric(f'lid_{name}', value, epoch=epoch_idx)
 
 
 def create_dataloaders(config: dict, rank: int, world_size: int):
@@ -83,6 +128,15 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
     best_val_loss = float('inf')
     dt_result = {}
     batch_idx_global = 0
+
+    # LID monitor setup (master process only): a fixed probe drawn from the
+    # validation set, re-used every epoch to track the contextual-embedding
+    # geometry as training proceeds.
+    lid_monitor, lid_probe = None, None
+    if rank == 0 and config.get('use_lid_monitor', False):
+        lid_monitor = LIDMonitor()
+        lid_probe = build_lid_probe(val_loader, config.get('lid_probe_batches', 2))
+        print(f"[LID] Monitoring enabled with {len(lid_probe)} probe batch(es).")
 
     for epoch_idx in range(config['epochs']):
         epoch_start_time = time.time()
@@ -173,9 +227,21 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
                 model.module.save_pretrained(save_path)
                 print(f"Best model saved to {save_path} (Val Loss: {best_val_loss:.4f})")
 
+            if lid_monitor is not None and lid_probe:
+                # Average training loss is unavailable here, so the most recent
+                # batch loss stands in; val loss is the epoch validation loss.
+                measure_and_log_lid(
+                    model, tokenizer, lid_probe, config, device, lid_monitor,
+                    epoch_idx, train_loss=loss.item(), val_loss=avg_val_loss,
+                    logger=logger,
+                )
+
         dist.barrier()
 
     dt_result['best_val_loss'] = best_val_loss
+    if lid_monitor is not None:
+        dt_result['lid_history'] = lid_monitor.as_dict()
+        dt_result['lid_final_regime'] = lid_monitor.detect_regime().summary()
     return dt_result
 
 
